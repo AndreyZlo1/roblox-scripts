@@ -1,0 +1,24 @@
+-- shared.import() — все доступные алиасы
+-- Источник: RS.Packages:GetChildren() -> u39[name] = ModuleScript
+-- Вызов:    shared.import("alias") -> require(RS.Packages.alias)
+-- Исключение: "network" -> u17 instance (см. network.lua)
+
+shared.import("Enum")         -> RS.Packages.Enum          [ModuleScript]
+shared.import("React")        -> RS.Packages.React         [ModuleScript]
+shared.import("ReactRoblox")  -> RS.Packages.ReactRoblox   [ModuleScript]
+shared.import("Roact")        -> RS.Packages.Roact         [ModuleScript]
+shared.import("RoactRodux")   -> RS.Packages.RoactRodux    [ModuleScript]
+shared.import("Rodux")        -> RS.Packages.Rodux         [ModuleScript]
+shared.import("_Index")       -> RS.Packages._Index        [Folder] (зависимости)
+shared.import("asset")        -> RS.Packages.asset         [ModuleScript]
+shared.import("clients")      -> RS.Packages.clients       [ModuleScript]
+shared.import("frc")          -> RS.Packages.frc           [ModuleScript]
+shared.import("require")      -> RS.Packages.require       [ModuleScript]
+shared.import("server")       -> RS.Packages.server        [ModuleScript]
+shared.import("signal")       -> RS.Packages.signal        [ModuleScript]
+shared.import("network")      -> u17 instance [захардкожен в Flux/client] (см. network.lua)
+
+-- Использование в клиентских скриптах:
+-- local network, signal = shared.import("network", "signal")
+-- local React, ReactRoblox = shared.import("React", "ReactRoblox")
+-- shared.import("require")("ClientHandler")  <- точка входа клиента

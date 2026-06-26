@@ -1,0 +1,4 @@
+-- PlayerGui.Key.Value (JSON)
+-- network._key = HttpService:JSONDecode(this)
+
+[32,91,91,36,15]

@@ -1,0 +1,4 @@
+-- network._code
+-- Первый элемент каждого FireServer/InvokeServer payload
+
+df5343c9-706f-4dbb-8545-c60d2ce8d26b
