@@ -1,3 +1,4 @@
+-- killaura v4 | Flux-aware | BypassDistance + ForceHeadshot
 --[[
     BRM5KillAura — v3 (Flux rewrite)
 
@@ -65,6 +66,12 @@ local KA_CONFIG = {
     KillAuraBloodEffects        = true,
     KillAuraClientHitFx         = true,
     KillAuraForceHit            = true,
+    -- [PATCH v4] Bypass client-side distance check
+    KillAuraBypassDistance      = true,   -- растягивать reach до реальной дистанции до цели
+    KillAuraBypassDistanceMax   = 999,    -- максимальный override reach (юнитов)
+    -- [PATCH v4] Hitbox target bone — форсировать конкретную часть тела
+    KillAuraForceBone           = "Head", -- "Head" / "UpperTorso" / "LowerTorso" / nil (авто)
+    KillAuraForceHeadshot       = true,   -- всегда бить в голову (клиент + сервер)
     KillAuraTickInterval        = 0.2,
     KillAuraPickInterval        = 0.25,
     KillAuraCtxCacheSec         = 1.5,
@@ -768,14 +775,24 @@ local function impactDir(actor, aimPart, reach)
     if typeof(aimPoint) ~= "Vector3" then
         return (cam and cam.CFrame.LookVector or Vector3.new(0, 0, -1)) * reach
     end
+    local origin
     if type(actor) == "table" then
         local cf = rawget(actor, "CFrame")
         if typeof(cf) == "CFrame" then
-            local origin = cf:PointToWorldSpace(Vector3.new(0, 2.5, 0))
-            local to = aimPoint - origin
-            if to.Magnitude > 0.05 then return to.Unit * reach end
+            origin = cf:PointToWorldSpace(Vector3.new(0, 2.5, 0))
         end
     end
+    if not origin then origin = cam and cam.CFrame.Position or Vector3.new() end
+    local to = aimPoint - origin
+    local realDist = to.Magnitude
+    -- [PATCH v4] BypassDistance: растягиваем reach до реальной дистанции до цели
+    -- MeleeInventoryReplicator.Impact делает Raycast с вектором p28 — его длина = reach.
+    -- Если цель дальше reach, рейкаст промахнётся. Переопределяем reach = realDist + небольшой запас.
+    if CONFIG.KillAuraBypassDistance and realDist > 0.05 then
+        local maxReach = CONFIG.KillAuraBypassDistanceMax or 999
+        reach = math.min(realDist + 2.0, maxReach)  -- +2 юнита запас на движение
+    end
+    if realDist > 0.05 then return to.Unit * reach end
     return (cam and (aimPoint - cam.CFrame.Position).Unit or Vector3.new(0, 0, -1)) * reach
 end
 
@@ -791,6 +808,13 @@ local function resolveHitUid(targetUid, aimPart)
 end
 
 local function resolveHitPart(aimPart, targetData)
+    -- [PATCH v4] ForceHeadshot / ForceBone — всегда возвращаем нужную кость из model
+    local forceBone = CONFIG.KillAuraForceBone
+    if not forceBone and CONFIG.KillAuraForceHeadshot then forceBone = "Head" end
+    if forceBone and type(targetData) == "table" and targetData.model and targetData.model.Parent then
+        local forced = targetData.model:FindFirstChild(forceBone)
+        if forced and forced:IsA("BasePart") then return forced end
+    end
     if aimPart and aimPart:IsA("BasePart") and aimPart.Parent then return aimPart end
     if type(targetData) == "table" and targetData.model and targetData.model.Parent then
         local p = targetData.model:FindFirstChild("Head")
@@ -809,7 +833,12 @@ local function syntheticImpact(aimPart, targetUid, targetData)
     local part = resolveHitPart(aimPart, targetData)
     local uid  = resolveHitUid(targetUid, part or aimPart)
     if uid == nil then return nil end
-    return hitPos, uid, (part and part.Name) or "Head"
+    -- [PATCH v4] форсируем bone name по конфигу
+    local boneName = (CONFIG.KillAuraForceBone)
+        or (CONFIG.KillAuraForceHeadshot and "Head")
+        or (part and part.Name)
+        or "Head"
+    return hitPos, uid, boneName
 end
 
 local function findImpactFn(actor, ctx)
@@ -831,7 +860,9 @@ local function steeredImpact(self, dir, origImpact)
     local steerDir = impactDir(actor, aimPart, reach)
     local ok, hitPos, uid, bone = pcall(function() return origImpact(self, steerDir) end)
     if ok and typeof(hitPos) == "Vector3" and uid ~= nil and bone then
-        return hitPos, uid, bone
+        -- [PATCH v4] override bone если ForceHeadshot/ForceBone включён
+        local fb = CONFIG.KillAuraForceBone or (CONFIG.KillAuraForceHeadshot and "Head")
+        return hitPos, uid, fb or bone
     end
     local sPos, sUid, sBone = syntheticImpact(aimPart, targetUid, targetData)
     if sPos then return sPos, sUid, sBone end
@@ -903,6 +934,21 @@ local function fallbackMeleeSwing(actor, ctx, aimPart, targetUid, delay)
     if Bridge.networkFireServer then pcall(Bridge.networkFireServer, "InventoryAction", "Slash", slashVar) end
     task.delay(delay, function()
         local dir = impactDir(actor, aimPart, reach)
+        -- [PATCH v4] BypassDistance: временно патчим _distance в rep-обработчике
+        -- чтобы Raycast в MeleeInventoryReplicator.Impact не обрезал вектор
+        local rep = getRepHandler(actor, ctx)
+        local origRepDist = rep and rawget(rep, "_distance")
+        if CONFIG.KillAuraBypassDistance and rep then
+            local aimPt = State.kaAimPoint
+            if typeof(aimPt) == "Vector3" and type(actor) == "table" then
+                local cf = rawget(actor, "CFrame")
+                if typeof(cf) == "CFrame" then
+                    local orig = cf:PointToWorldSpace(Vector3.new(0, 2.5, 0))
+                    local d = (aimPt - orig).Magnitude
+                    rawset(rep, "_distance", math.min(d + 2.0, CONFIG.KillAuraBypassDistanceMax or 999))
+                end
+            end
+        end
         State.kaImpactSteer = true
         State.kaImpactPart  = aimPart
         State.kaImpactUid   = targetUid
@@ -910,6 +956,11 @@ local function fallbackMeleeSwing(actor, ctx, aimPart, targetUid, delay)
         State.kaImpactSteer = false
         State.kaImpactPart  = nil
         State.kaImpactUid   = nil
+        -- [PATCH v4] восстанавливаем _distance
+        if rep and origRepDist ~= nil then rawset(rep, "_distance", origRepDist) end
+        -- [PATCH v4] форсируем bone
+        local fb = CONFIG.KillAuraForceBone or (CONFIG.KillAuraForceHeadshot and "Head")
+        if fb and bone then bone = fb end
         if ok and typeof(hitPos) == "Vector3" and uid ~= nil and bone
             and Bridge.networkFireServer and Bridge.vector3ToTable then
             local t = Bridge.vector3ToTable(hitPos)
@@ -961,7 +1012,8 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
     local cd = swingCooldown(ctx)
     if not resetCd and now() - (State.kaLastSwing or 0) < cd then return false, "cooldown" end
     local tpos = kaRefPos(targetData) or (aimPart and aimPart.Position) or aimPoint
-    if typeof(tpos) == "Vector3" and (tpos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
+    -- [PATCH v4] BypassDistance: если включён bypass, не проверяем дальность через kaDist()
+    if not CONFIG.KillAuraBypassDistance and typeof(tpos) == "Vector3" and (tpos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
         return false, "out_of_reach"
     end
     local eqUid = normalizeEqUid(rawget(actor, "_equipped"))
@@ -1269,6 +1321,20 @@ end
 function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
 function _M.setDistance(n) CONFIG.KillAuraDistance = n end
+-- [PATCH v4] API для bypass distance и headshot
+function _M.setBypassDistance(enabled, maxReach)
+    CONFIG.KillAuraBypassDistance    = enabled ~= false
+    if type(maxReach) == "number" then CONFIG.KillAuraBypassDistanceMax = maxReach end
+end
+function _M.setForceBone(boneName)
+    -- boneName: "Head" | "UpperTorso" | "LowerTorso" | nil (авто)
+    CONFIG.KillAuraForceBone      = boneName
+    CONFIG.KillAuraForceHeadshot  = (boneName == "Head" or boneName == nil)
+end
+function _M.setForceHeadshot(enabled)
+    CONFIG.KillAuraForceHeadshot = enabled ~= false
+    if enabled ~= false then CONFIG.KillAuraForceBone = "Head" end
+end
 function _M.swingOnce()
     local ctx   = resolveMeleeContext(true)
     local actor = ctx and resolveActor(ctx) or nil
