@@ -732,6 +732,21 @@ local function getKaTimings()
 end
 
 
+-- Проверяет что MeleeSvc уже найден и сбутстраплен для данного eqUid
+local function meleeSvcReady(eqUid)
+    return State.kaMeleeSvc ~= nil
+        and State.kaBootEq == eqUid
+        and State.kaWarmupDone == true
+end
+
+-- Финализирует инициализацию svc: извлекает useEnv и помечает warmup=done
+local function finishSvcBootstrap(actor, rep, eqUid, ctx)
+    local env = extractUseEnv(State.kaMeleeSvc)
+    State.kaUseEnv     = env
+    State.kaWarmupDone = true
+    State.kaWarmupEq   = eqUid
+end
+
 local function ensureMeleeSvc(actor, ctx)
     if not actor or not ctx then return nil, nil end
     local rep   = ctx.handler or getEquippedRep(actor)
