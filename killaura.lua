@@ -1,4 +1,4 @@
--- killaura v6 | instant-impact | predict | no-fallback | no-wall-check | no-freeze | clean
+-- killaura v7 | instant-impact | predict | no-fallback | no-wall-check | no-freeze | fix-scanMeleeSvc
 --[[
     BRM5KillAura — v3 (Flux rewrite)
 
@@ -520,50 +520,161 @@ local function isMeleeSvcTable(obj)
     return true
 end
 
-local function scanMeleeSvc(actor, rep, eqUid)
-    if type(shared) == "table" and type(shared.import) == "function" then
-        local ok, invSvc = pcall(shared.import, "InventoryService")
-        if ok and type(invSvc) == "table" then
-            local inventories = rawget(invSvc, "_inventories")
-            if type(inventories) == "table" then
-                for _, group in pairs(inventories) do
-                    if type(group) ~= "table" then continue end
-                    for _, slot in ipairs(group) do
-                        if type(slot) ~= "table" then continue end
-                        local h = rawget(slot, "Handler")
-                        if isMeleeSvcTable(h) then
-                            local uid = normalizeEqUid(rawget(slot, "UID"))
-                            if eqUid == nil or uid == eqUid then
-                                State.kaSvcSrc = "invSvc._inventories"
-                                return h
-                            end
-                        end
-                    end
-                end
-                for _, group in pairs(inventories) do
-                    if type(group) ~= "table" then continue end
-                    for _, slot in ipairs(group) do
-                        local h = type(slot) == "table" and rawget(slot, "Handler") or nil
-                        if isMeleeSvcTable(h) then
-                            State.kaSvcSrc = "invSvc._inventories.any"
-                            return h
-                        end
-                    end
+-- Ищет MeleeInventory handler в таблице _inventories InventoryService
+local function searchInvSvcHandlers(invSvc, eqUid)
+    local inventories = rawget(invSvc, "_inventories")
+    if type(inventories) ~= "table" then return nil end
+    -- Первый проход: совпадение по UID
+    for _, group in pairs(inventories) do
+        if type(group) ~= "table" then continue end
+        for _, slot in ipairs(group) do
+            if type(slot) ~= "table" then continue end
+            local h = rawget(slot, "Handler")
+            if isMeleeSvcTable(h) then
+                local uid = normalizeEqUid(rawget(slot, "UID"))
+                if eqUid == nil or uid == eqUid then
+                    return h, "uid"
                 end
             end
         end
     end
+    -- Второй проход: любой MeleeInventory (экипирован — Equipped.UID)
+    local equipped = rawget(invSvc, "Equipped")
+    local equippedUid = equipped and normalizeEqUid(rawget(equipped, "UID"))
+    for _, group in pairs(inventories) do
+        if type(group) ~= "table" then continue end
+        for _, slot in ipairs(group) do
+            local h = type(slot) == "table" and rawget(slot, "Handler") or nil
+            if isMeleeSvcTable(h) then
+                local slotUid = normalizeEqUid(rawget(slot, "UID"))
+                -- Предпочитаем экипированный
+                if equippedUid and slotUid == equippedUid then
+                    return h, "equipped"
+                end
+            end
+        end
+    end
+    -- Третий проход: первый попавшийся
+    for _, group in pairs(inventories) do
+        if type(group) ~= "table" then continue end
+        for _, slot in ipairs(group) do
+            local h = type(slot) == "table" and rawget(slot, "Handler") or nil
+            if isMeleeSvcTable(h) then return h, "any" end
+        end
+    end
+    return nil
+end
+
+-- Получить InventoryService синглтон через все доступные пути
+local function resolveInvSvc()
+    -- Путь 1: Bridge.getGameSharedImport() — умеет getrenv() когда shared.import = nil
+    if type(Bridge.getGameSharedImport) == "function" then
+        local sh = Bridge.getGameSharedImport()
+        if sh and type(sh.import) == "function" then
+            local ok, svc = pcall(sh.import, "InventoryService")
+            if ok and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
+                return svc, "bridge.sharedImport"
+            end
+        end
+    end
+    -- Путь 2: shared.import напрямую (работает только если ещё не nil)
+    if type(shared) == "table" and type(shared.import) == "function" then
+        local ok, svc = pcall(shared.import, "InventoryService")
+        if ok and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
+            return svc, "shared.import"
+        end
+    end
+    -- Путь 3: require(RS.Packages.InventoryService) напрямую
+    local ok3, RS = pcall(function() return game:GetService("ReplicatedStorage") end)
+    if ok3 and RS then
+        local pkg = RS:FindFirstChild("Packages")
+        if pkg then
+            local mod = pkg:FindFirstChild("InventoryService") or pkg:FindFirstChild("require")
+            if mod and mod:IsA("ModuleScript") then
+                -- require через require-модуль Flux
+                local okR, req = pcall(require, mod)
+                if okR and type(req) == "function" then
+                    local ok4, svc = pcall(req, "InventoryService")
+                    if ok4 and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
+                        return svc, "require.mod"
+                    end
+                end
+                -- прямой require
+                local ok5, svc = pcall(require, mod)
+                if ok5 and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
+                    return svc, "require.direct"
+                end
+            end
+        end
+    end
+    -- Путь 4: Bridge.scanFluxInventoryService кэш (там может быть из предыдущего scan)
+    if type(Bridge.scanFluxInventoryService) == "function" then
+        local svc = Bridge.scanFluxInventoryService()
+        if type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
+            return svc, "bridge.scan"
+        end
+    end
+    -- Путь 5: EnvironmentService.Inventory (InventoryService хранит туда ссылку при Init)
+    if type(actor) == "table" then end -- actor недоступен здесь, пропускаем
+    -- Путь 6: точечный getgc — ищем ТОЛЬКО таблицы с _inventories (не полный heap)
+    -- Безопасно: выходим как только нашли, проверка дешёвая (одно rawget)
+    if type(getgc) == "function" then
+        local gcList = getgc(false)
+        if type(gcList) == "table" then
+            for _, v in ipairs(gcList) do
+                if type(v) ~= "table" then continue end
+                local inv = rawget(v, "_inventories")
+                if type(inv) ~= "table" then continue end
+                -- Проверяем что это InventoryService: есть _localActor и Inventories
+                if rawget(v, "_localActor") ~= nil and rawget(v, "Inventories") ~= nil then
+                    return v, "getgc.invSvc"
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function scanMeleeSvc(actor, rep, eqUid)
+    -- Получаем InventoryService любым доступным способом
+    local invSvc, invSrc = resolveInvSvc()
+    if type(invSvc) == "table" then
+        local h, hSrc = searchInvSvcHandlers(invSvc, eqUid)
+        if h then
+            State.kaSvcSrc = "invSvc." .. (hSrc or "?") .. "/" .. (invSrc or "?")
+            return h
+        end
+        warn("[KA] scanMeleeSvc: InventoryService найден (", invSrc, ") но MeleeInventory handler не найден.",
+             "eqUid=", tostring(eqUid), "_inventories keys=",
+             (function() local s=""; for k,_ in pairs(rawget(invSvc,"_inventories") or {}) do s=s..tostring(k).."," end return s end)())
+    else
+        warn("[KA] scanMeleeSvc: InventoryService не найден ни одним из 6 путей.")
+    end
+    -- Запасной вариант: ищем _use прямо в rep и его полях
     if type(rep) == "table" then
-        for _, key in ipairs({"_inventoryService", "_service", "_svc", "_parent"}) do
+        for _, key in ipairs({"_inventoryService", "_service", "_svc", "_parent", "_handler"}) do
             local v = rawget(rep, key)
             if isMeleeSvcTable(v) then
-                State.kaSvcSrc = "actor.scan"
+                State.kaSvcSrc = "rep." .. key
                 return v
             end
         end
+        -- rep._actor может держать ссылку на InventoryService через actor
+        local repActor = rawget(rep, "_actor")
+        if type(repActor) == "table" then
+            for _, key in ipairs({"_inventoryService", "InventoryService", "_invSvc"}) do
+                local v = rawget(repActor, key)
+                if type(v) == "table" then
+                    local h2 = searchInvSvcHandlers(v, eqUid)
+                    if h2 then
+                        State.kaSvcSrc = "rep._actor." .. key
+                        return h2
+                    end
+                end
+            end
+        end
     end
-    -- v5: getgc удалён — был причиной freeze при экипировке оружия
-    warn("[KA] scanMeleeSvc: svc не найден через InventoryService/rep scan — getgc отключён")
+    warn("[KA] scanMeleeSvc: svc не найден. rep=", tostring(rep), "actor=", tostring(actor))
     return nil
 end
 
@@ -1224,7 +1335,8 @@ end
 
 function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
-
+end
+end
 function _M.swingOnce()
     local ctx   = resolveMeleeContext(true)
     local actor = ctx and resolveActor(ctx) or nil
