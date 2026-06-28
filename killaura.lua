@@ -1224,8 +1224,7 @@ end
 
 function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
-end
-end
+
 function _M.swingOnce()
     local ctx   = resolveMeleeContext(true)
     local actor = ctx and resolveActor(ctx) or nil
