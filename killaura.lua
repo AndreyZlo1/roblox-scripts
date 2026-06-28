@@ -565,72 +565,29 @@ local function searchInvSvcHandlers(invSvc, eqUid)
     return nil
 end
 
--- Получить InventoryService синглтон через все доступные пути
+-- Получить InventoryService синглтон через getnilinstances + require (кэш Roblox)
 local function resolveInvSvc()
-    -- Путь 1: Bridge.getGameSharedImport() — умеет getrenv() когда shared.import = nil
-    if type(Bridge.getGameSharedImport) == "function" then
-        local sh = Bridge.getGameSharedImport()
-        if sh and type(sh.import) == "function" then
-            local ok, svc = pcall(sh.import, "InventoryService")
-            if ok and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
-                return svc, "bridge.sharedImport"
-            end
-        end
-    end
-    -- Путь 2: shared.import напрямую (работает только если ещё не nil)
-    if type(shared) == "table" and type(shared.import) == "function" then
-        local ok, svc = pcall(shared.import, "InventoryService")
-        if ok and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
-            return svc, "shared.import"
-        end
-    end
-    -- Путь 3: require(RS.Packages.InventoryService) напрямую
-    local ok3, RS = pcall(function() return game:GetService("ReplicatedStorage") end)
-    if ok3 and RS then
-        local pkg = RS:FindFirstChild("Packages")
-        if pkg then
-            local mod = pkg:FindFirstChild("InventoryService") or pkg:FindFirstChild("require")
-            if mod and mod:IsA("ModuleScript") then
-                -- require через require-модуль Flux
-                local okR, req = pcall(require, mod)
-                if okR and type(req) == "function" then
-                    local ok4, svc = pcall(req, "InventoryService")
-                    if ok4 and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
-                        return svc, "require.mod"
-                    end
-                end
-                -- прямой require
-                local ok5, svc = pcall(require, mod)
-                if ok5 and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
-                    return svc, "require.direct"
+    -- Единственный метод: getnilinstances() → require()
+    -- Flux уничтожает свои ModuleScript'ы (script:Destroy) после загрузки,
+    -- они живут в nil-parent, но require()-кэш Roblox держит результат в памяти.
+    -- require(уничтоженный ModuleScript) → мгновенно возвращает синглтон из кэша.
+    if type(getnilinstances) == "function" then
+        local ok0, nils = pcall(getnilinstances)
+        if ok0 and type(nils) == "table" then
+            for _, inst in ipairs(nils) do
+                local okC, cls = pcall(function() return inst.ClassName end)
+                if not okC or cls ~= "ModuleScript" then continue end
+                local okN, nm  = pcall(function() return inst.Name end)
+                if not okN or nm ~= "InventoryService" then continue end
+                local okR, svc = pcall(require, inst)
+                if okR and type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
+                    return svc, "getnilinstances.require"
                 end
             end
         end
-    end
-    -- Путь 4: Bridge.scanFluxInventoryService кэш (там может быть из предыдущего scan)
-    if type(Bridge.scanFluxInventoryService) == "function" then
-        local svc = Bridge.scanFluxInventoryService()
-        if type(svc) == "table" and rawget(svc, "_inventories") ~= nil then
-            return svc, "bridge.scan"
-        end
-    end
-    -- Путь 5: EnvironmentService.Inventory (InventoryService хранит туда ссылку при Init)
-    if type(actor) == "table" then end -- actor недоступен здесь, пропускаем
-    -- Путь 6: точечный getgc — ищем ТОЛЬКО таблицы с _inventories (не полный heap)
-    -- Безопасно: выходим как только нашли, проверка дешёвая (одно rawget)
-    if type(getgc) == "function" then
-        local gcList = getgc(false)
-        if type(gcList) == "table" then
-            for _, v in ipairs(gcList) do
-                if type(v) ~= "table" then continue end
-                local inv = rawget(v, "_inventories")
-                if type(inv) ~= "table" then continue end
-                -- Проверяем что это InventoryService: есть _localActor и Inventories
-                if rawget(v, "_localActor") ~= nil and rawget(v, "Inventories") ~= nil then
-                    return v, "getgc.invSvc"
-                end
-            end
-        end
+        warn("[KA] resolveInvSvc: getnilinstances не нашёл InventoryService ModuleScript.")
+    else
+        warn("[KA] resolveInvSvc: getnilinstances недоступен в этом экзекуторе.")
     end
     return nil, nil
 end
