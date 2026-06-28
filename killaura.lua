@@ -1,4 +1,4 @@
--- killaura v4 | Flux-aware | BypassDistance + ForceHeadshot
+-- killaura v6 | instant-impact | predict | no-fallback | no-wall-check | no-freeze | clean
 --[[
     BRM5KillAura — v3 (Flux rewrite)
 
@@ -59,34 +59,27 @@ local KA_CONFIG = {
     KillAura                    = true,
     KillAuraAuto                = true,
     KillAuraDistance            = 30,
-    KillAuraImpactDelay         = 0.25,
-    KillAuraSwingCooldown       = 0.55,
     KillAuraFOV                 = 360,
     KillAuraPreferPlayers       = true,
     KillAuraBloodEffects        = true,
     KillAuraClientHitFx         = true,
     KillAuraForceHit            = true,
-    -- [PATCH v4] Bypass client-side distance check
+    -- [v5] Bypass client-side distance check
     KillAuraBypassDistance      = true,   -- растягивать reach до реальной дистанции до цели
     KillAuraBypassDistanceMax   = 999,    -- максимальный override reach (юнитов)
-    -- [PATCH v4] Hitbox target bone — форсировать конкретную часть тела
+    -- [v5] Hitbox target bone — форсировать конкретную часть тела
     KillAuraForceBone           = "Head", -- "Head" / "UpperTorso" / "LowerTorso" / nil (авто)
     KillAuraForceHeadshot       = true,   -- всегда бить в голову (клиент + сервер)
     KillAuraTickInterval        = 0.2,
     KillAuraPickInterval        = 0.25,
     KillAuraCtxCacheSec         = 1.5,
-    KillAuraWarmupGc            = true,
-    KillAuraModifyEnabled       = true,
-    KillAuraApplySilentModify   = true,
-    KillAuraModifyReachMult     = 1.4,
-    KillAuraModifyDelayMult     = 0.7,
-    KillAuraModifyCooldownMult  = 0.75,
-    KillAuraModifyPresets = {
-        ExtraReach  = true,
-        FastImpact  = true,
-        FastSwing   = true,
-        LightWeight = true,
-    },
+    -- v5: не зависим от оружейных характеристик — жёсткие константы
+    KillAuraReach               = 999,   -- bypass distance: reach при отправке Impact вектора
+    KillAuraSwingCd             = 0.35,  -- cooldown между ударами (наш, не из оружия)
+    -- v5: predict — смещение позиции цели вперёд по velocity
+    KillAuraPredictMs           = 80,    -- упреждение в мс (0 = выкл)
+    -- v5: bypass wall check — отключить LOS проверку
+    KillAuraNoWallCheck         = true,
     KillAuraDebugKey = Enum.KeyCode.H,
     KillAuraViz      = true,
 }
@@ -207,22 +200,7 @@ local function getFluxLocalActor()
         end
     end
 
-    -- Вариант 3: getgc — ищем таблицу ReplicatorService с полем LocalActor
-    if not found and type(getgc) == "function" then
-        for _, v in pairs(getgc(false)) do
-            if type(v) == "table" then
-                local la = rawget(v, "LocalActor")
-                if type(la) == "table"
-                    and rawget(la, "Alive")  ~= nil
-                    and rawget(la, "Health") ~= nil
-                    and rawget(la, "Owner")  ~= nil
-                then
-                    found = la
-                    break
-                end
-            end
-        end
-    end
+    -- Вариант 3: getgc УДАЛЁН — вызывал lag spike при экипировке оружия (итерация всего gc heap)
 
     _fluxActorCache     = found
     _fluxActorCacheTime = t
@@ -409,7 +387,10 @@ local function buildTargetPool(actor)
         if Bridge.isActorDead   and Bridge.isActorDead(data)     then continue end
         local pos = kaRefPos(data)
         if typeof(pos) ~= "Vector3" then continue end
-        if (pos - losOrigin).Magnitude <= maxDist then
+        -- v5: BypassDistance — добавляем всех живых врагов без ограничения дистанции
+        if CONFIG.KillAuraBypassDistance then
+            pool[#pool + 1] = data
+        elseif (pos - losOrigin).Magnitude <= maxDist then
             pool[#pool + 1] = data
         end
     end
@@ -446,7 +427,9 @@ local function pickTarget(force, actor)
         local part, point = resolveAim(data)
         if typeof(point) ~= "Vector3" then continue end
         local d = (point - losOrigin).Magnitude
-        if d <= kaDist() and (best == nil or d < bestDist) then
+        -- v5: bypass distance — не фильтруем по kaDist()
+        local inRange = CONFIG.KillAuraBypassDistance or d <= kaDist()
+        if inRange and (best == nil or d < bestDist) then
             best, bestPart, bestPoint, bestDist = data, part, point, d
         end
     end
@@ -464,7 +447,10 @@ local function validateTarget(actor)
     if Bridge.isActorDead   and Bridge.isActorDead(target)     then clearKaTarget() return false end
     local pos = kaRefPos(target) or (State.kaAimPart and State.kaAimPart.Position) or State.kaAimPoint
     if typeof(pos) ~= "Vector3" then clearKaTarget() return false end
-    if (pos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then clearKaTarget() return false end
+    -- v5: bypass distance
+    if not CONFIG.KillAuraBypassDistance and (pos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
+        clearKaTarget() return false
+    end
     local part, point = resolveAim(target)
     State.kaAimPart  = part  or State.kaAimPart
     State.kaAimPoint = point or pos
@@ -576,27 +562,8 @@ local function scanMeleeSvc(actor, rep, eqUid)
             end
         end
     end
-    if type(getgc) == "function" and CONFIG.KillAuraWarmupGc ~= false then
-        local build = rep and rawget(rep, "_build")
-        local best, bestScore = nil, 0
-        for _, obj in getgc(true) do
-            if not isMeleeSvcTable(obj) then continue end
-            local score = 1
-            if build and rawget(obj, "_build") == build          then score += 10 end
-            if actorsMatch(rawget(obj, "_actor"), actor)          then score += 20 end
-            local item = rawget(obj, "_item")
-            if eqUid and type(item) == "table" then
-                local meta = rawget(item, "MetaData")
-                local uid  = meta and normalizeEqUid(rawget(meta, "UID")) or nil
-                if uid == eqUid then score += 25 end
-            end
-            if score > bestScore then bestScore = score; best = obj end
-        end
-        if best then
-            State.kaSvcSrc = "getgc"
-            return best
-        end
-    end
+    -- v5: getgc удалён — был причиной freeze при экипировке оружия
+    warn("[KA] scanMeleeSvc: svc не найден через InventoryService/rep scan — getgc отключён")
     return nil
 end
 
@@ -646,62 +613,13 @@ local function getActionTypeInv()
     return nil
 end
 
-local function getMeleeBuildCfg(build)
-    if not build then return nil end
-    if kaSharedMeleeCfg == nil then
-        local ok, mods = pcall(Bridge.loadSharedModules)
-        kaSharedMeleeCfg = ok and type(mods) == "table" and mods.Melee or false
-    end
-    if type(kaSharedMeleeCfg) ~= "table" then return nil end
-    return kaSharedMeleeCfg[build]
+-- v5: weapon-cfg независимые тайминги — всё из CONFIG
+local function getKaTimings()
+    local reach = CONFIG.KillAuraReach or 999
+    local cd    = CONFIG.KillAuraSwingCd or 0.35
+    return reach, cd
 end
 
-local function applyMeleeMods(svc, ctx, eqUid)
-    if CONFIG.KillAuraModifyEnabled == false or type(svc) ~= "table" then return end
-    eqUid = eqUid or "?"
-    State.kaMeleeModBackup = State.kaMeleeModBackup or {}
-    if not State.kaMeleeModBackup[eqUid] then
-        State.kaMeleeModBackup[eqUid] = {
-            distance = rawget(svc, "_distance"),
-            delay    = rawget(svc, "_delay"),
-            timer    = rawget(svc, "_timer"),
-        }
-    end
-    local bak = State.kaMeleeModBackup[eqUid]
-    local presets   = CONFIG.KillAuraModifyPresets or {}
-    local baseReach = (type(bak.distance) == "number" and bak.distance > 0) and bak.distance or 5
-    local baseDelay = (type(bak.delay)    == "number" and bak.delay    > 0) and bak.delay    or (CONFIG.KillAuraImpactDelay   or 0.25)
-    local baseTimer = (type(bak.timer)    == "number" and bak.timer    > 0) and bak.timer    or (CONFIG.KillAuraSwingCooldown or 0.55)
-    if presets.ExtraReach  then rawset(svc, "_distance", baseReach * (CONFIG.KillAuraModifyReachMult     or 1.4)) end
-    if presets.FastImpact  then rawset(svc, "_delay",    baseDelay * (CONFIG.KillAuraModifyDelayMult     or 0.7)) end
-    if presets.FastSwing   then rawset(svc, "_timer",    baseTimer * (CONFIG.KillAuraModifyCooldownMult  or 0.75)) end
-    if presets.LightWeight then
-        local item = ctx and ctx.item
-        local meta = type(item) == "table" and rawget(item, "MetaData") or nil
-        if meta and type(rawget(meta, "Weight")) == "number" then
-            rawset(meta, "Weight", math.max(1, math.floor(rawget(meta, "Weight") * 0.2)))
-        end
-    end
-end
-
-local function meleeSvcReady(eqUid)
-    eqUid = normalizeEqUid(eqUid)
-    local boot = normalizeEqUid(State.kaBootEq)
-    return State.kaMeleeSvc ~= nil and boot ~= nil and boot == eqUid
-        and getHandlerMethod(State.kaMeleeSvc, "_use") ~= nil
-end
-
-local function finishSvcBootstrap(actor, rep, eqUid, ctx)
-    if not State.kaMeleeSvc then return end
-    if State.kaModsAppliedEq ~= eqUid then
-        pcall(applyMeleeMods, State.kaMeleeSvc, ctx, eqUid)
-        State.kaModsAppliedEq = eqUid
-    end
-    pcall(extractUseEnv, State.kaMeleeSvc)
-    getActionTypeInv()
-    State.kaWarmupEq   = eqUid
-    State.kaWarmupDone = true
-end
 
 local function ensureMeleeSvc(actor, ctx)
     if not actor or not ctx then return nil, nil end
@@ -728,43 +646,7 @@ local function getRepHandler(actor, ctx)
     return getEquippedRep(actor) or (ctx and ctx.handler) or nil
 end
 
-local function getMeleeTiming(ctx)
-    local reach = 5
-    local delay = CONFIG.KillAuraImpactDelay or 0.25
-    if State.kaUseEnv then
-        if type(State.kaUseEnv.distance) == "number" and State.kaUseEnv.distance > 0 then
-            reach = State.kaUseEnv.distance
-        end
-        if type(State.kaUseEnv.delay) == "number" and State.kaUseEnv.delay > 0 then
-            delay = State.kaUseEnv.delay
-        end
-        return reach, delay
-    end
-    local handler = ctx and ctx.handler
-    local build   = type(handler) == "table" and rawget(handler, "_build") or nil
-    local cfg = getMeleeBuildCfg(build)
-    if type(cfg) == "table" then
-        if type(cfg.Reach) == "number"  and cfg.Reach > 0  then reach = cfg.Reach  end
-        if type(cfg.Delay) == "number"  and cfg.Delay > 0  then delay = cfg.Delay  end
-    end
-    return reach, delay
-end
 
-local function swingCooldown(ctx)
-    local cd = CONFIG.KillAuraSwingCooldown or 0.55
-    if State.kaMeleeSvc and type(rawget(State.kaMeleeSvc, "_timer")) == "number"
-        and rawget(State.kaMeleeSvc, "_timer") > 0 then
-        cd = rawget(State.kaMeleeSvc, "_timer")
-    else
-        local handler = ctx and ctx.handler
-        local build   = type(handler) == "table" and rawget(handler, "_build") or nil
-        local cfg = getMeleeBuildCfg(build)
-        if type(cfg) == "table" and type(cfg.Cooldown) == "number" and cfg.Cooldown > 0 then
-            cd = cfg.Cooldown
-        end
-    end
-    return cd
-end
 
 local function impactDir(actor, aimPart, reach)
     local aimPoint = State.kaAimPoint
@@ -785,7 +667,7 @@ local function impactDir(actor, aimPart, reach)
     if not origin then origin = cam and cam.CFrame.Position or Vector3.new() end
     local to = aimPoint - origin
     local realDist = to.Magnitude
-    -- [PATCH v4] BypassDistance: растягиваем reach до реальной дистанции до цели
+    -- [v5] BypassDistance: растягиваем reach до реальной дистанции до цели
     -- MeleeInventoryReplicator.Impact делает Raycast с вектором p28 — его длина = reach.
     -- Если цель дальше reach, рейкаст промахнётся. Переопределяем reach = realDist + небольшой запас.
     if CONFIG.KillAuraBypassDistance and realDist > 0.05 then
@@ -808,22 +690,19 @@ local function resolveHitUid(targetUid, aimPart)
 end
 
 local function resolveHitPart(aimPart, targetData)
-    -- [PATCH v4] ForceHeadshot / ForceBone — всегда возвращаем нужную кость из model
+    -- [v5] ForceHeadshot / ForceBone — всегда возвращаем нужную кость из model
     local forceBone = CONFIG.KillAuraForceBone
     if not forceBone and CONFIG.KillAuraForceHeadshot then forceBone = "Head" end
     if forceBone and type(targetData) == "table" and targetData.model and targetData.model.Parent then
         local forced = targetData.model:FindFirstChild(forceBone)
         if forced and forced:IsA("BasePart") then return forced end
     end
+    -- v6: если ForceBone не нашёл кость — это ошибка модели цели, сообщаем
     if aimPart and aimPart:IsA("BasePart") and aimPart.Parent then return aimPart end
-    if type(targetData) == "table" and targetData.model and targetData.model.Parent then
-        local p = targetData.model:FindFirstChild("Head")
-            or targetData.model:FindFirstChild("UpperTorso")
-            or targetData.model:FindFirstChild("HumanoidRootPart")
-            or targetData.root
-        if p and p:IsA("BasePart") then return p end
-    end
-    return aimPart
+    local fb = CONFIG.KillAuraForceBone or (CONFIG.KillAuraForceHeadshot and "Head") or "Head"
+    warn("[KA] resolveHitPart: кость '", tostring(fb), "' не найдена в model. aimPart=", tostring(aimPart),
+         "model=", type(targetData) == "table" and tostring(targetData.model) or "nil")
+    return nil
 end
 
 local function syntheticImpact(aimPart, targetUid, targetData)
@@ -833,7 +712,7 @@ local function syntheticImpact(aimPart, targetUid, targetData)
     local part = resolveHitPart(aimPart, targetData)
     local uid  = resolveHitUid(targetUid, part or aimPart)
     if uid == nil then return nil end
-    -- [PATCH v4] форсируем bone name по конфигу
+    -- [v5] форсируем bone name по конфигу
     local boneName = (CONFIG.KillAuraForceBone)
         or (CONFIG.KillAuraForceHeadshot and "Head")
         or (part and part.Name)
@@ -860,13 +739,16 @@ local function steeredImpact(self, dir, origImpact)
     local steerDir = impactDir(actor, aimPart, reach)
     local ok, hitPos, uid, bone = pcall(function() return origImpact(self, steerDir) end)
     if ok and typeof(hitPos) == "Vector3" and uid ~= nil and bone then
-        -- [PATCH v4] override bone если ForceHeadshot/ForceBone включён
+        -- [v5] override bone если ForceHeadshot/ForceBone включён
         local fb = CONFIG.KillAuraForceBone or (CONFIG.KillAuraForceHeadshot and "Head")
         return hitPos, uid, fb or bone
     end
+    -- v6: no fallback — если origImpact не попал и synthetic не дал uid, это ошибка
     local sPos, sUid, sBone = syntheticImpact(aimPart, targetUid, targetData)
     if sPos then return sPos, sUid, sBone end
-    return origImpact(self, dir)
+    warn("[KA] steeredImpact: origImpact промахнулся и synthetic не разрешил uid. aimPart=",
+        tostring(aimPart), "targetUid=", tostring(targetUid))
+    return nil
 end
 
 local function ensureRepImpactHook(actor, ctx)
@@ -888,87 +770,116 @@ local function ensureRepImpactHook(actor, ctx)
     return true
 end
 
-local function triggerGameMeleeUse(svc)
+local function triggerGameMeleeUse(svc, actor, ctx, aimPart, targetData)
+    -- v5: INSTANT IMPACT — не ждём _delay из оружия, шлём Impact сразу после Slash
     local useFn = getHandlerMethod(svc, "_use")
-    if type(useFn) ~= "function" then return false, "no_use" end
+    if type(useFn) ~= "function" then
+        warn("[KA] triggerGameMeleeUse: нет _use в svc —", tostring(svc))
+        return false, "no_use"
+    end
     if State.kaUseThreadActive then
         local since = State.kaUseThreadSince or 0
-        if since > 0 and now() - since < 0.75 then return false, "use_busy" end
+        if since > 0 and now() - since < 0.5 then return false, "use_busy" end
         State.kaUseThreadActive = false
     end
-    local delay = rawget(svc, "_delay")
-    if type(delay) ~= "number" or delay <= 0 then delay = CONFIG.KillAuraImpactDelay or 0.25 end
-    local timer = rawget(svc, "_timer")
-    if type(timer) ~= "number" or timer <= 0 then timer = CONFIG.KillAuraSwingCooldown or 0.55 end
+    local _, cd = getKaTimings()
     State.kaUseThreadActive = true
     State.kaUseThreadSince  = now()
+    -- Slash анимация/звук через _use(svc, true) — но Impact шлём сами немедленно
     task.spawn(function()
-        local ok = pcall(function() useFn(svc, true) end)
+        local ok, err = pcall(useFn, svc, true)
         if not ok then
             State.kaUseThreadActive = false
-            State.kaUseThreadSince  = 0
+            warn("[KA] _use(true) error:", tostring(err))
         end
     end)
-    task.delay(math.max(0.05, delay + 0.1), function()
-        pcall(function() useFn(svc, false) end)
-        State.kaUseThreadActive = false
-        State.kaUseThreadSince  = 0
-    end)
-    task.delay(1.0, function()
-        if State.kaUseThreadActive and now() - (State.kaUseThreadSince or 0) >= 0.95 then
-            State.kaUseThreadActive = false
-            State.kaUseThreadSince  = 0
+    -- v5: немедленная отправка Impact серверу — не ждём _delay
+    -- Сервер принимает: hitPos (Vector3Table), uid (string), bone (string)
+    do
+        local net    = State.kaUseEnv and State.kaUseEnv.net
+        local v3fn   = Bridge.vector3ToTable
+        local at     = getActionTypeInv()
+        local actFn  = actor and getHandlerMethod(actor, "Action")
+        local slashN = math.random(1, 3)
+        -- Slash сетевой пакет
+        if net and net.FireServer then
+            pcall(net.FireServer, net, "InventoryAction", "Slash", slashN)
+        elseif Bridge.networkFireServer then
+            pcall(Bridge.networkFireServer, "InventoryAction", "Slash", slashN)
         end
-    end)
-    return true, delay + timer
-end
-
-local function fallbackMeleeSwing(actor, ctx, aimPart, targetUid, delay)
-    local actionFn = getHandlerMethod(actor, "Action")
-    if type(actionFn) ~= "function" then return false, "no_action" end
-    local at = getActionTypeInv()
-    if not at then return false, "no_enum" end
-    local reach = select(1, getMeleeTiming(ctx))
-    local slashVar = math.random(1, 3)
-    pcall(function() actionFn(actor, at, "Slash", slashVar) end)
-    if Bridge.networkFireServer then pcall(Bridge.networkFireServer, "InventoryAction", "Slash", slashVar) end
-    task.delay(delay, function()
-        local dir = impactDir(actor, aimPart, reach)
-        -- [PATCH v4] BypassDistance: временно патчим _distance в rep-обработчике
-        -- чтобы Raycast в MeleeInventoryReplicator.Impact не обрезал вектор
-        local rep = getRepHandler(actor, ctx)
-        local origRepDist = rep and rawget(rep, "_distance")
-        if CONFIG.KillAuraBypassDistance and rep then
-            local aimPt = State.kaAimPoint
-            if typeof(aimPt) == "Vector3" and type(actor) == "table" then
-                local cf = rawget(actor, "CFrame")
-                if typeof(cf) == "CFrame" then
-                    local orig = cf:PointToWorldSpace(Vector3.new(0, 2.5, 0))
-                    local d = (aimPt - orig).Magnitude
-                    rawset(rep, "_distance", math.min(d + 2.0, CONFIG.KillAuraBypassDistanceMax or 999))
+        -- Impact — сразу, без delay
+        local reach  = CONFIG.KillAuraReach or 999
+        local dir    = impactDir(actor, aimPart, reach)
+        -- v5: predict — смещаем hitPos по velocity цели
+        local predictMs = CONFIG.KillAuraPredictMs or 0
+        local aimPt = State.kaAimPoint
+        if predictMs > 0 and type(targetData) == "table" and targetData.model then
+            local root = targetData.model:FindFirstChild("HumanoidRootPart") or targetData.root
+            if root and root:IsA("BasePart") then
+                local vel = root.AssemblyLinearVelocity
+                if vel.Magnitude > 0.5 then
+                    local dt = predictMs / 1000
+                    aimPt = (typeof(aimPt) == "Vector3" and aimPt or root.Position) + vel * dt
                 end
             end
         end
-        State.kaImpactSteer = true
-        State.kaImpactPart  = aimPart
-        State.kaImpactUid   = targetUid
-        local ok, hitPos, uid, bone = pcall(function() return actionFn(actor, at, "Impact", dir) end)
-        State.kaImpactSteer = false
-        State.kaImpactPart  = nil
-        State.kaImpactUid   = nil
-        -- [PATCH v4] восстанавливаем _distance
-        if rep and origRepDist ~= nil then rawset(rep, "_distance", origRepDist) end
-        -- [PATCH v4] форсируем bone
-        local fb = CONFIG.KillAuraForceBone or (CONFIG.KillAuraForceHeadshot and "Head")
-        if fb and bone then bone = fb end
-        if ok and typeof(hitPos) == "Vector3" and uid ~= nil and bone
-            and Bridge.networkFireServer and Bridge.vector3ToTable then
-            local t = Bridge.vector3ToTable(hitPos)
-            if t then pcall(Bridge.networkFireServer, "InventoryAction", "Impact", t, uid, bone) end
+        -- v5: bypass wall — форсируем synthetic impact без raycast
+        -- (MeleeInventoryReplicator.Impact делает Raycast на клиенте для эффектов,
+        --  но сервер принимает hitPos/uid/bone напрямую — стены не мешают серверу)
+        local hitPos, uid, bone
+        if CONFIG.KillAuraNoWallCheck then
+            -- обходим raycast полностью — подаём данные напрямую
+            local part = resolveHitPart(aimPart, targetData)
+            uid  = resolveHitUid(targetData and targetData.uid, part or aimPart)
+            bone = (CONFIG.KillAuraForceBone) or (CONFIG.KillAuraForceHeadshot and "Head") or
+                   (part and part.Name) or "Head"
+            hitPos = typeof(aimPt) == "Vector3" and aimPt or (part and part.Position)
+            if not hitPos or uid == nil then
+                warn("[KA] NoWallCheck: нет hitPos или uid — part:", tostring(part), "uid:", tostring(uid))
+            end
+        else
+            -- обычный путь через ActorClass.Action
+            if at and actFn then
+                State.kaImpactSteer = true
+                State.kaImpactPart  = aimPart
+                State.kaImpactUid   = targetData and targetData.uid or nil
+                local ok2, hp, u, b = pcall(actFn, actor, at, "Impact", dir)
+                State.kaImpactSteer = false
+                State.kaImpactPart  = nil
+                State.kaImpactUid   = nil
+                if ok2 then hitPos, uid, bone = hp, u, b end
+                local fb = CONFIG.KillAuraForceBone or (CONFIG.KillAuraForceHeadshot and "Head")
+                if fb then bone = fb end
+            end
         end
+        if typeof(hitPos) == "Vector3" and uid ~= nil and bone and v3fn then
+            local t = v3fn(hitPos)
+            if t then
+                local netFire = (net and net.FireServer and function(...) pcall(net.FireServer, net, ...) end)
+                    or Bridge.networkFireServer
+                if netFire then
+                    netFire("InventoryAction", "Impact", t, uid, bone)
+                else
+                    warn("[KA] Impact: нет сетевого FireServer — Bridge.networkFireServer=", tostring(Bridge.networkFireServer))
+                end
+            else
+                warn("[KA] Impact: vector3ToTable вернул nil для", tostring(hitPos))
+            end
+        else
+            warn("[KA] Impact пакет не отправлен: hitPos=", tostring(hitPos),
+                 "uid=", tostring(uid), "bone=", tostring(bone), "v3fn=", tostring(v3fn))
+        end
+    end
+    -- Останавливаем _use через cd
+    task.delay(math.max(0.05, cd - 0.05), function()
+        pcall(useFn, svc, false)
+        State.kaUseThreadActive = false
+        State.kaUseThreadSince  = 0
     end)
-    return true, "fallback.Action"
+    return true, cd
 end
+
+-- fallbackMeleeSwing удалён полностью (v6)
 
 local function kaHasValidAim(aimPart, aimPoint, targetData)
     if typeof(aimPoint) == "Vector3" then return true end
@@ -1009,10 +920,10 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
     if State.kaSwingBusy then return false, "busy" end
     if type(actor) ~= "table" then return false, "no_actor" end
     if not kaHasValidAim(aimPart, aimPoint, targetData) then return false, "no_aim" end
-    local cd = swingCooldown(ctx)
+    local _, cd = getKaTimings()
     if not resetCd and now() - (State.kaLastSwing or 0) < cd then return false, "cooldown" end
     local tpos = kaRefPos(targetData) or (aimPart and aimPart.Position) or aimPoint
-    -- [PATCH v4] BypassDistance: если включён bypass, не проверяем дальность через kaDist()
+    -- [v5] BypassDistance: если включён bypass, не проверяем дальность через kaDist()
     if not CONFIG.KillAuraBypassDistance and typeof(tpos) == "Vector3" and (tpos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
         return false, "out_of_reach"
     end
@@ -1026,7 +937,7 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
             releaseSwingState()
             return false, "actor_locked"
         end
-        local okUse, useInfo = triggerGameMeleeUse(svc)
+        local okUse, useInfo = triggerGameMeleeUse(svc, actor, ctx, aimPart, targetData)
         if okUse then
             markSwingSuccess()
             State.kaLastSlashNet   = "game._use"
@@ -1037,18 +948,11 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
         end
         releaseSwingState()
     end
-    local delay = select(2, getMeleeTiming(ctx))
-    local okFb, reason = fallbackMeleeSwing(actor, ctx, aimPart, targetData and targetData.uid or nil, delay)
-    if not okFb then
-        releaseSwingState()
-        return false, reason or "fallback_fail"
-    end
-    markSwingSuccess()
-    State.kaLastSlashNet   = "fallback.Action"
-    State.kaLastImpactMode = "fallback.Action"
-    State.kaLastImpactNet  = "fallback.Action"
-    endSwingState(math.max(cd, delay))
-    return true, "fallback.Action"
+    -- v5: svc не найден — это ошибка, не молчим
+    warn("[KA] performSwing: svc=nil после ensureMeleeSvc. equipped=",
+        tostring(rawget(actor, "_equipped")), "actor=", tostring(actor))
+    releaseSwingState()
+    return false, "no_svc"
 end
 
 local function countEnemies()
@@ -1320,20 +1224,7 @@ end
 
 function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
-function _M.setDistance(n) CONFIG.KillAuraDistance = n end
--- [PATCH v4] API для bypass distance и headshot
-function _M.setBypassDistance(enabled, maxReach)
-    CONFIG.KillAuraBypassDistance    = enabled ~= false
-    if type(maxReach) == "number" then CONFIG.KillAuraBypassDistanceMax = maxReach end
 end
-function _M.setForceBone(boneName)
-    -- boneName: "Head" | "UpperTorso" | "LowerTorso" | nil (авто)
-    CONFIG.KillAuraForceBone      = boneName
-    CONFIG.KillAuraForceHeadshot  = (boneName == "Head" or boneName == nil)
-end
-function _M.setForceHeadshot(enabled)
-    CONFIG.KillAuraForceHeadshot = enabled ~= false
-    if enabled ~= false then CONFIG.KillAuraForceBone = "Head" end
 end
 function _M.swingOnce()
     local ctx   = resolveMeleeContext(true)
