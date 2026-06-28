@@ -66,9 +66,6 @@ local KA_CONFIG = {
     KillAuraBloodEffects        = true,
     KillAuraClientHitFx         = true,
     KillAuraForceHit            = true,
-    -- [v5] Bypass client-side distance check
-    KillAuraBypassDistance      = true,   -- растягивать reach до реальной дистанции до цели
-    KillAuraBypassDistanceMax   = 999,    -- максимальный override reach (юнитов)
     -- [v5] Hitbox target bone — форсировать конкретную часть тела
     KillAuraForceBone           = "Head", -- "Head" / "UpperTorso" / "LowerTorso" / nil (авто)
     KillAuraForceHeadshot       = true,   -- всегда бить в голову (клиент + сервер)
@@ -404,10 +401,7 @@ local function buildTargetPool(actor)
         if Bridge.isActorDead   and Bridge.isActorDead(data)     then continue end
         local pos = kaRefPos(data)
         if typeof(pos) ~= "Vector3" then continue end
-        -- v5: BypassDistance — добавляем всех живых врагов без ограничения дистанции
-        if CONFIG.KillAuraBypassDistance then
-            pool[#pool + 1] = data
-        elseif (pos - losOrigin).Magnitude <= maxDist then
+        if (pos - losOrigin).Magnitude <= maxDist then
             pool[#pool + 1] = data
         end
     end
@@ -444,9 +438,7 @@ local function pickTarget(force, actor)
         local part, point = resolveAim(data)
         if typeof(point) ~= "Vector3" then continue end
         local d = (point - losOrigin).Magnitude
-        -- v5: bypass distance — не фильтруем по kaDist()
-        local inRange = CONFIG.KillAuraBypassDistance or d <= kaDist()
-        if inRange and (best == nil or d < bestDist) then
+        if d <= kaDist() and (best == nil or d < bestDist) then
             best, bestPart, bestPoint, bestDist = data, part, point, d
         end
     end
@@ -464,8 +456,7 @@ local function validateTarget(actor)
     if Bridge.isActorDead   and Bridge.isActorDead(target)     then clearKaTarget() return false end
     local pos = kaRefPos(target) or (State.kaAimPart and State.kaAimPart.Position) or State.kaAimPoint
     if typeof(pos) ~= "Vector3" then clearKaTarget() return false end
-    -- v5: bypass distance
-    if not CONFIG.KillAuraBypassDistance and (pos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
+    if (pos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
         clearKaTarget() return false
     end
     local part, point = resolveAim(target)
@@ -635,12 +626,6 @@ local function getKaTimings()
     local reach = CONFIG.KillAuraReach or 999
     local cd    = CONFIG.KillAuraSwingCd or 0.35
     return reach, cd
-end    if kaSharedMeleeCfg == nil then
-        local ok, mods = pcall(Bridge.loadSharedModules)
-        kaSharedMeleeCfg = ok and type(mods) == "table" and mods.Melee or false
-    end
-    if type(kaSharedMeleeCfg) ~= "table" then return nil end
-    return kaSharedMeleeCfg[build]
 end
 
 
@@ -669,24 +654,7 @@ local function getRepHandler(actor, ctx)
     return getEquippedRep(actor) or (ctx and ctx.handler) or nil
 end
 
-        if type(State.kaUseEnv.delay) == "number" and State.kaUseEnv.delay > 0 then
-            delay = State.kaUseEnv.delay
-        end
-        return reach, delay
-    end
-    local handler = ctx and ctx.handler
-    local build   = type(handler) == "table" and rawget(handler, "_build") or nil
-    local cfg = nil --[[v5: no weapon cfg]]
-    if type(cfg) == "table" then
-        if type(cfg.Reach) == "number"  and cfg.Reach > 0  then reach = cfg.Reach  end
-        if type(cfg.Delay) == "number"  and cfg.Delay > 0  then delay = cfg.Delay  end
-    end
-    return reach, delay
-end
 
-    end
-    return cd
-end
 
 local function impactDir(actor, aimPart, reach)
     local aimPoint = State.kaAimPoint
@@ -707,13 +675,6 @@ local function impactDir(actor, aimPart, reach)
     if not origin then origin = cam and cam.CFrame.Position or Vector3.new() end
     local to = aimPoint - origin
     local realDist = to.Magnitude
-    -- [v5] BypassDistance: растягиваем reach до реальной дистанции до цели
-    -- MeleeInventoryReplicator.Impact делает Raycast с вектором p28 — его длина = reach.
-    -- Если цель дальше reach, рейкаст промахнётся. Переопределяем reach = realDist + небольшой запас.
-    if CONFIG.KillAuraBypassDistance and realDist > 0.05 then
-        local maxReach = CONFIG.KillAuraBypassDistanceMax or 999
-        reach = math.min(realDist + 2.0, maxReach)  -- +2 юнита запас на движение
-    end
     if realDist > 0.05 then return to.Unit * reach end
     return (cam and (aimPoint - cam.CFrame.Position).Unit or Vector3.new(0, 0, -1)) * reach
 end
@@ -966,8 +927,7 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
     local _, cd = getKaTimings()
     if not resetCd and now() - (State.kaLastSwing or 0) < cd then return false, "cooldown" end
     local tpos = kaRefPos(targetData) or (aimPart and aimPart.Position) or aimPoint
-    -- [v5] BypassDistance: если включён bypass, не проверяем дальность через kaDist()
-    if not CONFIG.KillAuraBypassDistance and typeof(tpos) == "Vector3" and (tpos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
+    if typeof(tpos) == "Vector3" and (tpos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
         return false, "out_of_reach"
     end
     local eqUid = normalizeEqUid(rawget(actor, "_equipped"))
@@ -1267,8 +1227,7 @@ end
 
 function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
-end
-end
+
 function _M.swingOnce()
     local ctx   = resolveMeleeContext(true)
     local actor = ctx and resolveActor(ctx) or nil
