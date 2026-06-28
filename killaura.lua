@@ -1,4 +1,4 @@
--- killaura v7 | instant-impact | predict | no-fallback | no-wall-check | no-freeze | fix-scanMeleeSvc
+-- killaura v7.1 | instant-impact | predict | no-fallback | no-wall-check | no-freeze | fix-scanMeleeSvc | fix-balance
 --[[
     BRM5KillAura — v3 (Flux rewrite)
 
@@ -1335,8 +1335,7 @@ end
 
 function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
-end
-end
+
 function _M.swingOnce()
     local ctx   = resolveMeleeContext(true)
     local actor = ctx and resolveActor(ctx) or nil
